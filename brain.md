@@ -1,4 +1,4 @@
-# IKO BRAIN — Complete Project Knowledge (v0.2.0-universal+attachments+dragbot+sir-p0+p1-pdf+p1b-ocr+p2-retrieval+hud-drag+copilot-fix+claude-fix+full-history+hud-loading-fix+reconnect+hud-welcome-gate)
+# IKO BRAIN — Complete Project Knowledge (v0.2.0-universal+attachments+dragbot+sir-p0+p1-pdf+p1b-ocr+p2-retrieval+hud-drag+copilot-fix+claude-fix+full-history+hud-loading-fix+reconnect+hud-welcome-gate+extension-logo)
 
 > Read this first. It documents every feature, file, data flow, upgrade,
 > and how to extend the project without breaking it.
@@ -839,6 +839,13 @@ src/migration/adapters/mock-source-adapter.js + mock/mock-session.js + tests/mig
     `none / thread-too-small(n)`, which is what the repo's own test
     "a new-chat welcome screen is not counted as a conversation" expects.
     `npm test` 78/78.
+
+51. Extension card showed the browser's default placeholder icon. Added a
+    retro-arcade IKO mark: bold "IK" monogram, the "O" drawn as a context gauge
+    (yellow arc + lime live dot), sky-blue frame and black hard shadow. Assets:
+    `icons/icon{16,32,48,128}.png` (16/32 use a simplified mark), editable
+    `icons/iko-logo.svg` / `iko-logo-small.svg`, and the manifest `icons` map.
+    Verified in Brave's `brave://extensions` card. `npm test` unchanged 78/78.
 
 ## 5. Build / test / run
 

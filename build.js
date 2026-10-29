@@ -2,6 +2,14 @@ const esbuild = require("esbuild");
 const fs = require("fs");
 const path = require("path");
 
+function copyAsset(source, destination) {
+    if (!fs.existsSync(source)) {
+        throw new Error(`Missing build asset: ${source}. Run npm install first.`);
+    }
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+}
+
 async function build() {
     fs.mkdirSync("dist", {
         recursive: true
@@ -96,8 +104,37 @@ async function build() {
         );
     }
 
+    // Bundled OCR engine — Tesseract.js, its WASM core, and the English
+    // traineddata all ship inside the extension. No CDN/remote code.
+    const tesseractDist = path.join("node_modules", "tesseract.js", "dist");
+    const tesseractVendor = path.join("dist", "vendor", "tesseract");
+    copyAsset(
+        path.join(tesseractDist, "tesseract.min.js"),
+        path.join(tesseractVendor, "tesseract.min.js")
+    );
+    copyAsset(
+        path.join(tesseractDist, "worker.min.js"),
+        path.join(tesseractVendor, "worker.min.js")
+    );
+    copyAsset(
+        path.join(tesseractDist, "tesseract.min.js.LICENSE.txt"),
+        path.join(tesseractVendor, "LICENSE-tesseract.js.txt")
+    );
+    copyAsset(
+        path.join("node_modules", "tesseract.js-core", "tesseract-core-lstm.wasm.js"),
+        path.join(tesseractVendor, "tesseract-core-lstm.wasm.js")
+    );
+    copyAsset(
+        path.join("node_modules", "tesseract.js-core", "LICENSE"),
+        path.join(tesseractVendor, "LICENSE-tesseract.js-core.txt")
+    );
+    copyAsset(
+        path.join("node_modules", "@tesseract.js-data", "eng", "4.0.0_best_int", "eng.traineddata.gz"),
+        path.join(tesseractVendor, "lang", "eng.traineddata.gz")
+    );
+
     console.log(
-        "IKO GPT, Claude, bridge, and migration builds completed."
+        "IKO GPT, Claude, bridge, migration, and OCR builds completed."
     );
 }
 

@@ -24,7 +24,9 @@
     "gpt-tokenizer": "^4.0.0"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "@tesseract.js-data/eng": "^1.0.0",
+    "esbuild": "^0.28.2",
+    "tesseract.js": "^7.0.0"
   },
   "allowScripts": {
     "esbuild@0.28.2": true

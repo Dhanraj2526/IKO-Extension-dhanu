@@ -11,6 +11,8 @@ IKO is a Chrome extension that estimates conversation context and helps move cha
 - Adjustable context warning threshold (50%, 60%, 70%, or 80%).
 - Movable HUD and IKO launcher button; their positions are saved locally.
 - Session migration between ChatGPT and Claude, with a prepared conversation preview before opening the destination.
+- Local image OCR with a bundled Tesseract.js engine and English model — fully offline, no CDN or API key.
+- Multi-pass OCR preprocessing (up to 2× upscale, grayscale, contrast stretch) with automatic page-segmentation retry and a low-confidence warning when an image cannot reach 90% confidence.
 - Local token estimates; no IKO server or personal API key is required for the HUD.
 
 ## Install in Chrome

@@ -65,6 +65,72 @@ test("scannedToSIR wraps OCR text in SIR with confidence", async () => {
     delete global.window.IKOOCR.peer;
 });
 
+test("scannedToSIR marks low-confidence OCR in @CONF", async () => {
+    global.window = global.window || {};
+    global.window.IKOOCR = global.window.IKOOCR || {};
+    global.window.IKOOCR.peer = {
+        recognize: async () => ({ text: "blurry invoice 42", confidence: 65, lowConfidence: true })
+    };
+    const res = await OCR.scannedToSIR(fakeImageData(4, 4, () => [0, 0, 0]), {}, SIR);
+    assert.equal(res.route, "sir");
+    assert.ok(res.l3.includes("warning=low-confidence"));
+    delete global.window.IKOOCR.peer;
+});
+
+test("bundled offscreen engine is used when no peer/global exists", async () => {
+    global.chrome = {
+        runtime: {
+            id: "iko-test",
+            sendMessage: async (message) => {
+                assert.equal(message.type, "IKO_OCR_RECOGNIZE");
+                assert.ok(message.image.startsWith("data:image/png;base64,"));
+                return { success: true, text: "OFFSCREEN invoice 42", confidence: 88 };
+            }
+        }
+    };
+    const r = await OCR.recognize("data:image/png;base64,AAAA");
+    assert.equal(r.route, "ocr-text");
+    assert.equal(r.engine, "tesseract-offscreen");
+    assert.ok(r.text.includes("OFFSCREEN"));
+    assert.ok(r.confidence > 0.8 && r.confidence <= 1);
+    delete global.chrome;
+});
+
+test("offscreen low-confidence results carry the warning through", async () => {
+    global.chrome = {
+        runtime: {
+            id: "iko-test",
+            sendMessage: async () => ({
+                success: true,
+                text: "blurry invoice 42",
+                confidence: 65,
+                lowConfidence: true,
+                passes: [{ pass: "raw-psm3", confidence: 65, chars: 18 }]
+            })
+        }
+    };
+    const r = await OCR.recognize("data:image/png;base64,AAAA");
+    assert.equal(r.route, "ocr-text");
+    assert.equal(r.lowConfidence, true);
+    assert.equal(r.passes.length, 1);
+    assert.ok(r.confidence > 0.6 && r.confidence < 0.7);
+    delete global.chrome;
+});
+
+test("offscreen failure is reported honestly", async () => {
+    global.chrome = {
+        runtime: {
+            id: "iko-test",
+            sendMessage: async () => ({ success: false, error: "worker failed" })
+        }
+    };
+    const r = await OCR.recognize("data:image/png;base64,AAAA");
+    assert.equal(r.route, "ocr-failed");
+    assert.equal(r.engine, "tesseract-offscreen");
+    assert.ok(r.error.includes("worker failed"));
+    delete global.chrome;
+});
+
 test("empty OCR normalizes to ocr-empty, not fake text", async () => {
     global.window = global.window || {};
     global.window.IKOOCR = global.window.IKOOCR || {};

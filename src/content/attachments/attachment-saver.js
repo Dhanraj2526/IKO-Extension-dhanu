@@ -27,6 +27,22 @@ function fmtTok(n) {
     return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
 }
 
+function ocrFailureText(ocr) {
+    if (!ocr) return "OCR failed";
+    if (ocr.route === "ocr-empty") return "OCR found no readable text";
+    if (ocr.route === "ocr-engine-missing") {
+        return "OCR engine disconnected — refresh this tab (F5), then retry";
+    }
+    const detail = String(ocr.error || ocr.guidance || "").trim();
+    if (/extension context invalidated|receiving end does not exist|message port closed/i.test(detail)) {
+        return "OCR engine disconnected — refresh this tab (F5), then retry";
+    }
+    if (/offscreen|createDocument/i.test(detail)) {
+        return "OCR engine unavailable — reload IKO in chrome://extensions, then refresh this tab";
+    }
+    return detail ? `OCR failed — ${detail.slice(0, 120)}` : "OCR failed";
+}
+
 function loadImageDims(file) {
     return new Promise((resolve) => {
         try {
@@ -168,7 +184,7 @@ function buildImageText(rec, out, newTokens, savedPct, ocrText, palette) {
         }
     } catch { /* keep manual fallback below */ }
     if (ocrText) lines.push(`text=${String(ocrText).slice(0, 1500)}`);
-    else lines.push("text=(no OCR engine — install Tesseract vendor or register window.IKOOCR.peer for text extraction)");
+    else lines.push("text=(OCR unavailable — reload IKO or check the extension console)");
     if (palette?.length && !lines.some(l => l.startsWith("colors="))) lines.push(`colors=${palette.join(",")}`);
     lines.push(`note=delete the attached image and paste this block instead to hold ~${fmtTok(newTokens)} image→~${fmtTok(countTextTokens(lines.join("\n")))} text (−${savedPct}% image tokens)`);
     return lines.join("\n");
@@ -351,11 +367,19 @@ function openPanel() {
                         const newTokens = estimateImageTokens(out.w, out.h);
                         const saved = Math.max(0, Math.round((1 - newTokens / Math.max(1, rec.origTokens)) * 100));
                         let ocrText = "";
+                        let ocrConfidence = 0;
+                        let ocrLow = false;
                         try {
                             const ocr = window.IKOOCRCore, sir = window.IKOSIRCore;
                             if (ocr?.scannedToSIR) {
-                                const res = await ocr.scannedToSIR(out.blob, { id: rec.name, title: rec.name, kind: "image" }, sir || null);
-                                if (res?.route === "sir" && res.l3) ocrText = String(res.l3);
+                                // OCR the original pixels, not the 1024px preview:
+                                // the offscreen engine does its own bounded scaling.
+                                const res = await ocr.scannedToSIR(rec.file, { id: rec.name, title: rec.name, kind: "image" }, sir || null);
+                                if (res?.route === "sir" && res.l3) {
+                                    ocrText = String(res.l3);
+                                    ocrConfidence = Number(res.ocr?.confidence || 0);
+                                    ocrLow = res.ocr?.lowConfidence === true;
+                                }
                             }
                         } catch { /* text block still useful without OCR */ }
                         const palette = await samplePalette(out.blob, 5);
@@ -366,7 +390,10 @@ function openPanel() {
                         rec._lastSaved = saved;
                         const txtTok = fmtTok(countTextTokens(fullText));
                         pill.textContent = `~${fmtTok(newTokens)} ▸ ~${txtTok} text`;
-                        say(`${rec.width || "?"}×${rec.height || "?"} → ${out.w}×${out.h} · −${saved}%${ocrText ? " · OCR" : " · no OCR"} · ${copied ? "copied — remove the image" : "copy blocked — use Insert"}`);
+                        const ocrLabel = ocrText
+                            ? `OCR ${Math.round(ocrConfidence * 100)}%${ocrLow ? " (low — check)" : ""}`
+                            : "no OCR";
+                        say(`${rec.width || "?"}×${rec.height || "?"} → ${out.w}×${out.h} · −${saved}% · ${ocrLabel} · ${copied ? "copied — remove the image" : "copy blocked — use Insert"}`, !ocrLow);
                         try { window.IKO?.logger?.info?.("Attachments", "shrunk-to-text", { name: rec.name, savedPct: saved, ocr: !!ocrText }); } catch { /* ignore */ }
                         shrink.textContent = `−${saved}% ✓`;
                         ensureInsertBtn();
@@ -416,21 +443,24 @@ function openPanel() {
                 const ocrBtn = document.createElement("button");
                 ocrBtn.type = "button"; ocrBtn.className = "iko-att-btn";
                 ocrBtn.textContent = "OCR";
-                ocrBtn.title = "Run local OCR if installed";
+                ocrBtn.title = "Run local OCR (Tesseract, offline)";
                 ocrBtn.addEventListener("click", async () => {
                     ocrBtn.textContent = "…";
                     try {
                         const ocr = window.IKOOCRCore;
                         const sir = window.IKOSIRCore;
                         if (!ocr) throw new Error("OCR engine loading — wait 2s and retry");
+                        say("Loading local OCR…");
                         const res = await ocr.scannedToSIR(rec.file, { id: rec.name, title: rec.name, kind: rec.kind }, sir || null);
                         if (res.route === "sir") {
                             try { await navigator.clipboard.writeText(res.l3); } catch { /* ignore */ }
-                            say(`OCR copied · conf ${Number(res.ocr.confidence || 0).toFixed(2)} · ${res.ocr.engine}`);
-                            ocrBtn.textContent = "Copied";
+                            const conf = Math.round(Number(res.ocr.confidence || 0) * 100);
+                            const low = res.ocr.lowConfidence === true;
+                            say(`OCR copied · conf ${conf}%${low ? " (low — image may be too small/blurry; check text)" : ""} · ${res.ocr.engine}`, !low);
+                            ocrBtn.textContent = low ? "Copied ⚠" : "Copied";
                         } else {
-                            say(`No OCR engine — add Tesseract or IKOOCR.peer`, false);
-                            ocrBtn.textContent = "No engine";
+                            say(ocrFailureText(res.ocr), false);
+                            ocrBtn.textContent = res.ocr?.route === "ocr-empty" ? "No text" : "Failed";
                         }
                     } catch (err) { ocrBtn.textContent = "Failed"; }
                     setTimeout(() => { ocrBtn.textContent = "OCR"; }, 2000);
@@ -477,7 +507,7 @@ function openPanel() {
                 const ocrBtn = document.createElement("button");
                 ocrBtn.type = "button"; ocrBtn.className = "iko-att-btn";
                 ocrBtn.textContent = "OCR";
-                ocrBtn.title = "Scanned pages need a local OCR engine";
+                ocrBtn.title = "Scanned pages need a rasterized image — screenshot the page";
                 ocrBtn.addEventListener("click", async () => {
                     ocrBtn.textContent = "…";
                     try {
@@ -487,15 +517,18 @@ function openPanel() {
                         const buf = await rec.file.arrayBuffer();
                         // Scanned PDFs need page raster (pdf.js render) before pixels exist —
                         // try peer/VLM directly on the blob; honest route when absent.
+                        say("Loading local OCR…");
                         const res = await ocr.scannedToSIR(rec.file, { id: rec.name, title: rec.name, kind: "pdf-scan" }, sir || null);
                         void buf;
                         if (res.route === "sir") {
                             try { await navigator.clipboard.writeText(res.l3); } catch { /* ignore */ }
-                            say(`OCR copied · conf ${Number(res.ocr.confidence || 0).toFixed(2)}`);
-                            ocrBtn.textContent = "Copied";
+                            const conf = Math.round(Number(res.ocr.confidence || 0) * 100);
+                            const low = res.ocr.lowConfidence === true;
+                            say(`OCR copied · conf ${conf}%${low ? " (low — check text)" : ""}`, !low);
+                            ocrBtn.textContent = low ? "Copied ⚠" : "Copied";
                         } else {
-                            say(`No OCR engine — screenshot the page or add Tesseract`, false);
-                            ocrBtn.textContent = "No engine";
+                            say(ocrFailureText(res.ocr), false);
+                            ocrBtn.textContent = res.ocr?.route === "ocr-empty" ? "No text" : "Failed";
                         }
                     } catch (err) { ocrBtn.textContent = "Failed"; }
                     setTimeout(() => { ocrBtn.textContent = "OCR"; }, 2000);

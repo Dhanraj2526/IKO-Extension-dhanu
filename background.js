@@ -49,8 +49,57 @@ function reply(sendResponse, payload) {
     }
 }
 
+let offscreenCreating = null;
+
+async function ensureOffscreenDocument() {
+    if (typeof chrome.offscreen?.hasDocument === "function" && await chrome.offscreen.hasDocument()) {
+        return;
+    }
+    if (!offscreenCreating) {
+        offscreenCreating = chrome.offscreen.createDocument({
+            url: "offscreen.html",
+            reasons: ["WORKERS"],
+            justification: "Run the bundled Tesseract OCR engine locally."
+        }).finally(() => {
+            offscreenCreating = null;
+        });
+    }
+    await offscreenCreating;
+}
+
+async function sendToOffscreen(payload) {
+    let lastError = null;
+    // createDocument can resolve just before the offscreen scripts finish
+    // registering their message listener, so retry briefly.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+            return await chrome.runtime.sendMessage(payload);
+        } catch (error) {
+            lastError = error;
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+    }
+    throw lastError || new Error("The OCR offscreen document did not respond.");
+}
+
+async function handleOcrRequest(message) {
+    if (!message.image || typeof message.image !== "string") {
+        return { success: false, error: "OCR image payload is missing." };
+    }
+    await ensureOffscreenDocument();
+    return sendToOffscreen({
+        target: "offscreen",
+        type: "IKO_OCR_OFFSCREEN",
+        image: message.image,
+        lang: message.lang || "eng"
+    });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.type !== "string") return false;
+
+    // Messages addressed to the offscreen document must not be answered here.
+    if (message.target === "offscreen") return false;
 
     if (!isAllowedSender(sender)) {
         reply(sendResponse, { success: false, error: "Unsupported or unauthorized sender page." });
@@ -103,6 +152,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 ? { success: false, error: error.message }
                 : { success: true });
         });
+        return true;
+    }
+
+    if (message.type === "IKO_OCR_RECOGNIZE") {
+        handleOcrRequest(message).then(
+            result => reply(sendResponse, result),
+            error => reply(sendResponse, {
+                success: false,
+                error: String(error?.message || error).slice(0, 300)
+            })
+        );
         return true;
     }
 

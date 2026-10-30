@@ -134,7 +134,7 @@
         });
     }
 
-    async function recognizeOffscreen(imageSource, { lang = "eng", timeoutMs = 60000 } = {}) {
+    async function recognizeOffscreen(imageSource, { lang = "eng", timeoutMs = 120000 } = {}) {
         const runtime = extensionRuntime();
         if (!runtime) return null;
 
@@ -176,7 +176,7 @@
 
     // Main entry. imageSource: ImageData | canvas | Blob | ImageBitmap.
     // Returns {route, text, confidence, engine} — never throws on missing engine.
-    async function recognize(imageSource, { lang = "eng", timeoutMs = 60000 } = {}) {
+    async function recognize(imageSource, { lang = "eng", timeoutMs = 120000 } = {}) {
         const peer = rootPeer();
         if (peer?.recognize) {
             try {

@@ -301,7 +301,7 @@ window.IKO.ui = {
                     <button type="button" id="iko-hud-optimize" title="Optimize your current prompt">
                         <span class="iko-btn-label">Optimize</span>
                     </button>
-                    <button type="button" id="iko-hud-files" title="Optimize image/PDF uploads to save tokens">
+                    <button type="button" id="iko-hud-files" title="Optimize image, PDF, and Word uploads to save tokens">
                         <span class="iko-btn-label">Files</span>
                     </button>
                 </div>
@@ -408,7 +408,7 @@ window.IKO.ui = {
       const wrap = document.createElement("div");
       wrap.className = "iko-hud-actions";
       wrap.id = "iko-hud-actions";
-      wrap.innerHTML = '<button type="button" id="iko-hud-migrate" title="Migrate this session to another LLM"><svg class="iko-hud-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M3.5 12h14"/><path d="m11.5 5 7 7-7 7"/></svg><span class="iko-btn-label">Migrate</span></button><button type="button" id="iko-hud-optimize" title="Optimize your current prompt"><span class="iko-btn-label">Optimize</span></button><button type="button" id="iko-hud-files" title="Optimize image/PDF uploads"><span class="iko-btn-label">Files</span></button>';
+      wrap.innerHTML = '<button type="button" id="iko-hud-migrate" title="Migrate this session to another LLM"><svg class="iko-hud-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M3.5 12h14"/><path d="m11.5 5 7 7-7 7"/></svg><span class="iko-btn-label">Migrate</span></button><button type="button" id="iko-hud-optimize" title="Optimize your current prompt"><span class="iko-btn-label">Optimize</span></button><button type="button" id="iko-hud-files" title="Optimize image, PDF, and Word uploads"><span class="iko-btn-label">Files</span></button>';
       main.appendChild(wrap);
     } catch { /* ignore */ }
   },

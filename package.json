@@ -9,12 +9,13 @@
     "test:sir": "node --test src/migration/tests/sir.test.js",
     "test:pdf": "node --test src/migration/tests/pdf.test.js",
     "test:ocr": "node --test src/migration/tests/ocr.test.js",
+    "test:docx": "node --test src/migration/tests/docx.test.js",
     "test:retrieval": "node --test src/migration/tests/retrieval.test.js",
     "test:claude": "node --test src/migration/tests/claude.test.js",
     "test:composer": "node --test src/migration/tests/composer-io.test.js",
     "test:fullhistory": "node --test src/migration/tests/full-history.test.js",
     "test:chatthread": "node --test src/migration/tests/chat-thread.test.js",
-    "test": "node --test src/migration/tests/migration.test.js src/migration/tests/sir.test.js src/migration/tests/pdf.test.js src/migration/tests/ocr.test.js src/migration/tests/retrieval.test.js src/migration/tests/claude.test.js src/migration/tests/composer-io.test.js src/migration/tests/full-history.test.js src/migration/tests/chat-thread.test.js src/migration/tests/chatgpt-source-adapter.test.js"
+    "test": "node --test src/migration/tests/migration.test.js src/migration/tests/sir.test.js src/migration/tests/pdf.test.js src/migration/tests/ocr.test.js src/migration/tests/docx.test.js src/migration/tests/retrieval.test.js src/migration/tests/claude.test.js src/migration/tests/composer-io.test.js src/migration/tests/full-history.test.js src/migration/tests/chat-thread.test.js src/migration/tests/chatgpt-source-adapter.test.js src/migration/tests/pdf-layout.test.js src/migration/tests/text-compress.test.js"
   },
   "keywords": [],
   "author": "",
@@ -26,6 +27,7 @@
   "devDependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
     "esbuild": "^0.28.2",
+    "pdfjs-dist": "^6.4.299",
     "tesseract.js": "^7.0.0"
   },
   "allowScripts": {

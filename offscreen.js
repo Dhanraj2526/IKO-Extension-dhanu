@@ -240,7 +240,12 @@ function resetWorker() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message || message.type !== "IKO_OCR_OFFSCREEN") return false;
+    if (!message) return false;
+    if (message.target === "offscreen" && message.type === "IKO_OCR_OFFSCREEN_PING") {
+        sendResponse({ ready: true });
+        return false;
+    }
+    if (message.type !== "IKO_OCR_OFFSCREEN") return false;
 
     const task = queue.then(() => recognize(message.image));
     queue = task.catch(() => { /* keep the queue alive after failures */ });

@@ -51,47 +51,139 @@ function reply(sendResponse, payload) {
 
 let offscreenCreating = null;
 
+async function hasOffscreenDocument() {
+    try {
+        return typeof chrome.offscreen?.hasDocument === "function" && await chrome.offscreen.hasDocument();
+    } catch {
+        return false;
+    }
+}
+
+async function createOffscreenDocument() {
+    if (typeof chrome.offscreen?.createDocument !== "function") {
+        throw new Error("This browser does not support extension offscreen documents (chrome.offscreen is missing).");
+    }
+    const options = {
+        url: "offscreen.html",
+        reasons: ["WORKERS"],
+        justification: "Run the bundled Tesseract OCR engine locally."
+    };
+    try {
+        await chrome.offscreen.createDocument(options);
+    } catch (error) {
+        const detail = String(error?.message || error);
+        // Two callers can race here: if the other one won, reuse its document.
+        if (/single offscreen|already (exists|created|open)/i.test(detail) && await hasOffscreenDocument()) {
+            return;
+        }
+        // Brave can keep a hidden/stale document that hasDocument() cannot see.
+        // Clear it and try exactly once more before reporting the failure.
+        await closeOffscreenDocument();
+        await sleep(200);
+        try {
+            await chrome.offscreen.createDocument(options);
+        } catch (retryError) {
+            throw new Error(`Could not start the OCR offscreen document: ${String(retryError?.message || retryError)}`);
+        }
+    }
+}
+
 async function ensureOffscreenDocument() {
-    if (typeof chrome.offscreen?.hasDocument === "function" && await chrome.offscreen.hasDocument()) {
+    if (await hasOffscreenDocument()) {
         return;
     }
     if (!offscreenCreating) {
-        offscreenCreating = chrome.offscreen.createDocument({
-            url: "offscreen.html",
-            reasons: ["WORKERS"],
-            justification: "Run the bundled Tesseract OCR engine locally."
-        }).finally(() => {
+        offscreenCreating = createOffscreenDocument().finally(() => {
             offscreenCreating = null;
         });
     }
     await offscreenCreating;
 }
 
+async function closeOffscreenDocument() {
+    try {
+        if (await hasOffscreenDocument()) await chrome.offscreen.closeDocument();
+    } catch { /* ignore — a missing document is already the goal */ }
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function pingOffscreen() {
+    try {
+        const response = await Promise.race([
+            chrome.runtime.sendMessage({ target: "offscreen", type: "IKO_OCR_OFFSCREEN_PING" }),
+            sleep(1000).then(() => null)
+        ]);
+        return response?.ready === true;
+    } catch {
+        return false;
+    }
+}
+
+// createDocument resolves before the offscreen page has loaded its scripts.
+// Wait for the actual listener instead of relying on a fixed short delay.
+async function waitForOffscreen(timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (await pingOffscreen()) return true;
+        await sleep(100);
+    }
+    return false;
+}
+
 async function sendToOffscreen(payload) {
     let lastError = null;
-    // createDocument can resolve just before the offscreen scripts finish
-    // registering their message listener, so retry briefly.
+    // The listener can disappear between the readiness ping and the request
+    // (browser discards an idle offscreen page); retry briefly.
     for (let attempt = 0; attempt < 20; attempt += 1) {
         try {
             return await chrome.runtime.sendMessage(payload);
         } catch (error) {
             lastError = error;
-            await new Promise(resolve => setTimeout(resolve, 100));
+            await sleep(100);
         }
     }
     throw lastError || new Error("The OCR offscreen document did not respond.");
+}
+
+async function ensureReadyOffscreen() {
+    await ensureOffscreenDocument();
+    if (await waitForOffscreen()) return;
+    // A document that exists but never answers is wedged (failed script load
+    // or a crashed worker). Recreate it once before giving up.
+    await closeOffscreenDocument();
+    await ensureOffscreenDocument();
+    if (!await waitForOffscreen()) {
+        throw new Error("The local engine offscreen document is not answering. Check chrome://extensions for an IKO error, then reload the extension.");
+    }
 }
 
 async function handleOcrRequest(message) {
     if (!message.image || typeof message.image !== "string") {
         return { success: false, error: "OCR image payload is missing." };
     }
-    await ensureOffscreenDocument();
+    await ensureReadyOffscreen();
     return sendToOffscreen({
         target: "offscreen",
         type: "IKO_OCR_OFFSCREEN",
         image: message.image,
         lang: message.lang || "eng"
+    });
+}
+
+async function handlePdfTextRequest(message) {
+    if (!message.data || typeof message.data !== "string") {
+        return { success: false, error: "PDF payload is missing." };
+    }
+    await ensureReadyOffscreen();
+    return sendToOffscreen({
+        target: "offscreen",
+        type: "IKO_PDF_TEXT",
+        data: message.data,
+        name: String(message.name || "document.pdf").slice(0, 200),
+        ocr: ["auto", "never", "force"].includes(message.ocr) ? message.ocr : "auto"
     });
 }
 
@@ -152,6 +244,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 ? { success: false, error: error.message }
                 : { success: true });
         });
+        return true;
+    }
+
+    if (message.type === "IKO_PDF_TEXT") {
+        handlePdfTextRequest(message).then(
+            result => reply(sendResponse, result),
+            error => reply(sendResponse, {
+                success: false,
+                error: String(error?.message || error).slice(0, 300)
+            })
+        );
         return true;
     }
 

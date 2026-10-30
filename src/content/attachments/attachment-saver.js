@@ -8,6 +8,11 @@ const MAX_DIM = 1024;
 const JPEG_Q = 0.72;
 const seenFiles = []; // {id, name, kind, size, width, height, origTokens, file}
 let seq = 0;
+let panelRender = null; // live-refresh hook while the Attachments panel is open
+
+function refreshPanel() {
+    try { panelRender?.(); } catch { /* ignore */ }
+}
 
 function estimateImageTokens(w, h, detail = "high") {
     if (!w || !h) return 1500;
@@ -18,6 +23,90 @@ function estimateImageTokens(w, h, detail = "high") {
 
 function estimatePdfTokens(sizeBytes) {
     return Math.max(500, Math.ceil(sizeBytes / 4));
+}
+
+// Word documents: precise when the local .docx reader can extract the text,
+// bounded size-based guess otherwise (legacy .doc / unreadable archive).
+function estimateWordTokens(sizeBytes) {
+    try {
+        const core = window.IKODOCXCore;
+        if (core?.estimateWordTokens) return core.estimateWordTokens(sizeBytes);
+    } catch { /* ignore */ }
+    return Math.max(500, Math.ceil(Number(sizeBytes || 0) / 18));
+}
+
+function wordKind(file) {
+    const type = String(file?.type || "");
+    const name = String(file?.name || "");
+    if (/application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document/i.test(type) || /\.docx$/i.test(name)) return "docx";
+    if (/application\/msword/i.test(type) || /\.doc$/i.test(name)) return "doc";
+    return "";
+}
+
+async function extractWordText(file) {
+    const core = window.IKODOCXCore;
+    if (!core?.extractDocxText) throw new Error("Word reader loading — wait 2s and retry");
+    return core.extractDocxText(file);
+}
+
+// PDFs are read by PDF.js in the extension's offscreen page: the bundled
+// worker can decode compressed content streams (Flate/ASCII85) that a naive
+// byte scan cannot, and it keeps the 1.7MB engine out of every chat page.
+function readFileBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = String(reader.result || "");
+            const comma = result.indexOf(",");
+            resolve(comma >= 0 ? result.slice(comma + 1) : "");
+        };
+        reader.onerror = () => reject(reader.error || new Error("Could not read the PDF."));
+        reader.readAsDataURL(file);
+    });
+}
+
+async function extractPdfText(file, options = {}) {
+    const runtime = globalThis.chrome?.runtime;
+    if (!runtime?.sendMessage) throw new Error("PDF reader needs the IKO extension — refresh the tab.");
+    if (Number(file?.size || 0) > 30 * 1048576) {
+        throw new Error("PDF is too large for local text extraction (max 30MB).");
+    }
+    const data = await readFileBase64(file);
+    if (!data) throw new Error("Could not read this PDF.");
+    let response;
+    try {
+        response = await runtime.sendMessage({
+            type: "IKO_PDF_TEXT",
+            data,
+            name: file.name || "document.pdf",
+            ocr: ["auto", "never", "force"].includes(options.ocr) ? options.ocr : "auto"
+        });
+    } catch (error) {
+        const detail = String(error?.message || error);
+        if (/context invalidated|receiving end does not exist/i.test(detail)) {
+            throw new Error("Extension reloaded — refresh this tab and retry.");
+        }
+        throw new Error(detail.slice(0, 160));
+    }
+    if (!response?.success) throw new Error(String(response?.error || "PDF text extraction failed.").slice(0, 180));
+    return response;
+}
+
+// Flatten document text to one compact line for the SIR-style block. Keeps the
+// start of each paragraph (the informative part) up to the char budget.
+function condenseWordText(text, max = 1400) {
+    const lines = String(text || "")
+        .split(/\n+/)
+        .map(line => line.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+    let out = "";
+    for (const line of lines) {
+        if (out.length >= max) break;
+        const room = max - out.length - (out ? 1 : 0);
+        if (room <= 0) break;
+        out += (out ? " " : "") + line.slice(0, room);
+    }
+    return out;
 }
 
 function fmtKB(n) {
@@ -36,6 +125,15 @@ function ocrFailureText(ocr) {
     const detail = String(ocr.error || ocr.guidance || "").trim();
     if (/extension context invalidated|receiving end does not exist|message port closed/i.test(detail)) {
         return "OCR engine disconnected — refresh this tab (F5), then retry";
+    }
+    if (/timed out/i.test(detail)) {
+        return "OCR timed out — the first run can take ~30s; click OCR again";
+    }
+    if (/does not support.*offscreen/i.test(detail)) {
+        return "This browser cannot run the OCR offscreen engine — update Brave/Chrome";
+    }
+    if (/not answering|did not respond/i.test(detail)) {
+        return "OCR engine did not answer — reload IKO in chrome://extensions, then refresh this tab";
     }
     if (/offscreen|createDocument/i.test(detail)) {
         return "OCR engine unavailable — reload IKO in chrome://extensions, then refresh this tab";
@@ -94,7 +192,8 @@ async function compressImage(file, maxDim = MAX_DIM, quality = JPEG_Q) {
 }
 
 function compactDescriptor(rec, opt) {
-    const dim = opt ? `${opt.w}x${opt.h}` : rec.width && rec.height ? `${rec.width}x${rec.height}` : "?";
+    const isWord = rec.kind === "docx" || rec.kind === "doc";
+    const dim = opt ? `${opt.w}x${opt.h}` : rec.width && rec.height ? `${rec.width}x${rec.height}` : isWord ? "doc" : "?";
     const size = opt ? `${fmtKB(rec.size)}→${fmtKB(opt.blob?.size || rec.size)}` : fmtKB(rec.size);
     const tok = opt ? `${fmtTok(rec.origTokens)}→${fmtTok(opt.newTokens)}` : `~${fmtTok(rec.origTokens)}`;
     return `[media:${rec.kind} ${rec.name} ${dim} ${size} tokens:${tok}]`;
@@ -215,14 +314,15 @@ function recordFile(file) {
         if (!file || seenFiles.some(f => f.name === file.name && f.size === file.size)) return null;
         const isImg = /^image\//.test(file.type || "") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name || "");
         const isPdf = /pdf/i.test(file.type || "") || /\.pdf$/i.test(file.name || "");
-        if (!isImg && !isPdf) return null;
+        const word = wordKind(file);
+        if (!isImg && !isPdf && !word) return null;
         const rec = {
             id: `att-${++seq}-${Date.now() % 100000}`,
             name: file.name || `upload-${seq}`,
-            kind: isImg ? "image" : "pdf",
+            kind: isImg ? "image" : isPdf ? "pdf" : word,
             size: file.size || 0,
             width: 0, height: 0,
-            origTokens: isPdf ? estimatePdfTokens(file.size || 0) : 1500,
+            origTokens: isPdf ? estimatePdfTokens(file.size || 0) : word ? estimateWordTokens(file.size || 0) : 1500,
             file
         };
         seenFiles.unshift(rec);
@@ -233,9 +333,20 @@ function recordFile(file) {
                 rec.origTokens = estimateImageTokens(w || 1024, h || 1024);
                 renderBadge();
             });
+        } else if (word === "docx") {
+            // Read the text once, in the background, so the badge and the card
+            // show real tokens instead of the compressed-size guess.
+            extractWordText(file).then((text) => {
+                if (!text) return;
+                rec.text = text;
+                rec.origTokens = countTextTokens(text);
+                renderBadge();
+                refreshPanel();
+            }).catch(() => { /* keep the size-based estimate */ });
         }
         try { window.IKO?.logger?.info?.("Attachments", "file detected", { name: rec.name, kind: rec.kind, size: rec.size }); } catch { /* ignore */ }
         renderBadge();
+        refreshPanel();
         return rec;
     } catch { return null; }
 }
@@ -268,12 +379,13 @@ function renderBadge() {
         else btn.textContent = seenFiles.length ? `Files·~${fmtTok(total)}` : "Files";
         btn.title = seenFiles.length
             ? `${seenFiles.length} upload(s) detected · ~${fmtTok(total)} tokens. Click to optimize.`
-            : "No uploads detected yet. Attach an image/PDF to optimize it.";
+            : "No uploads detected yet. Attach an image, PDF, or Word file to optimize it.";
     } catch { /* ignore */ }
 }
 
 function openPanel() {
     try { document.getElementById("iko-attachments-panel")?.remove(); } catch { /* ignore */ }
+    panelRender = null;
     const mkBtn = (text, title, primary) => {
         const b = document.createElement("button");
         b.type = "button";
@@ -290,16 +402,19 @@ function openPanel() {
             <header class="iko-att-head">
                 <div class="iko-att-headtxt">
                     <div class="iko-att-title">Attachments${n ? ` <span class="iko-att-count">${n}</span>` : ""}</div>
-                    <div class="iko-att-sub">Shrink images to text before sending.</div>
+                    <div class="iko-att-sub">Shrink images, PDFs, and Word files before sending.</div>
                 </div>
                 <button type="button" class="iko-att-x" aria-label="Close">×</button>
             </header>
             <div class="iko-att-body">
                 <div class="iko-att-list" id="iko-att-list"></div>
-                <div class="iko-att-foot">Images cost ~170 tokens per 512px tile. Shrink to text replaces one with ~100 tokens of text — paste the block instead of the image, then remove the original.</div>
+                <div class="iko-att-foot">Images cost ~170 tokens per 512px tile. Shrink to text replaces one with ~100 tokens of text. Word files are read locally — Extract copies a compact block of the document text.</div>
             </div>
         </div>`;
-    root.querySelector(".iko-att-x")?.addEventListener("click", () => root.remove());
+    root.querySelector(".iko-att-x")?.addEventListener("click", () => {
+        if (panelRender) panelRender = null;
+        root.remove();
+    });
     // Group the theme switch with the close button
     try {
         const head = root.querySelector(".iko-att-head");
@@ -320,7 +435,7 @@ function openPanel() {
         if (!seenFiles.length) {
             const empty = document.createElement("div");
             empty.className = "iko-att-empty";
-            empty.textContent = "No uploads yet. Attach a file, then reopen.";
+            empty.textContent = "No uploads yet. Attach an image, PDF, or Word file.";
             list.appendChild(empty);
             return;
         }
@@ -466,36 +581,128 @@ function openPanel() {
                     setTimeout(() => { ocrBtn.textContent = "OCR"; }, 2000);
                 });
                 btns.appendChild(ocrBtn);
-            } else {
-                const parse = document.createElement("button");
-                parse.type = "button"; parse.className = "iko-att-btn primary";
-                parse.textContent = "Parse";
-                parse.title = "Extract text to a compact block and copy it";
-                parse.addEventListener("click", async () => {
-                    parse.textContent = "…";
-                    try {
-                        const pdf = window.IKOPDFCore;
-                        const sir = window.IKOSIRCore;
-                        if (!pdf) throw new Error("PDF engine loading — wait 2s and retry");
-                        const buf = await rec.file.arrayBuffer();
-                        const res = pdf.pdfToSIR(buf, { id: rec.name, title: rec.name }, sir || null);
-                        if (res.route === "ocr-required") {
-                            say(`Scanned PDF · needs OCR · flagged`, false);
-                            try { await navigator.clipboard.writeText(`[media:pdf ${rec.name} pages=${res.l1.pages || "?"} status=needs-ocr]`); } catch { /* ignore */ }
-                            parse.textContent = "Flagged";
-                        } else {
-                            const before = sir ? sir.countTokens(res.l2.preview + "") : res.l1.chars / 4;
-                            const after = sir ? sir.countTokens(res.l3) : res.l3.length / 4;
-                            try { await navigator.clipboard.writeText(res.l3); } catch { /* ignore */ }
-                            say(`${res.l1.pages}p · ~${Math.round(before)} → ~${Math.round(after)} · copied`);
-                            try { window.IKO?.logger?.info?.("Attachments", "pdf parsed", { name: rec.name, pages: res.l1.pages }); } catch { /* ignore */ }
-                            parse.textContent = "Copied";
+            } else if (rec.kind === "docx" || rec.kind === "doc") {
+                if (rec.kind === "docx") {
+                    const extract = document.createElement("button");
+                    extract.type = "button"; extract.className = "iko-att-btn primary";
+                    extract.textContent = "Extract";
+                    extract.title = "Read the Word text locally and copy a compact block";
+                    extract.addEventListener("click", async () => {
+                        extract.textContent = "…";
+                        try {
+                            const text = rec.text || await extractWordText(rec.file);
+                            if (!text) throw new Error("No text found in this .docx");
+                            rec.text = text;
+                            rec.origTokens = countTextTokens(text);
+                            const preview = condenseWordText(text);
+                            let entities = "";
+                            try {
+                                const sir = window.IKOSIRCore;
+                                if (sir?.textToSIR) entities = sir.textToSIR(text) || "";
+                            } catch { /* raw text is enough */ }
+                            const block = [
+                                compactDescriptor(rec, null),
+                                "@DOC type=docx",
+                                entities,
+                                preview ? `text=${preview}` : "",
+                                `note=paste this block instead of the .docx to hold ~${fmtTok(rec.origTokens)} tokens of Word text`
+                            ].filter(Boolean).join("\n");
+                            await copyText(block);
+                            say(`Word text · ~${fmtTok(rec.origTokens)} → ~${fmtTok(countTextTokens(block))} · copied`);
+                            extract.textContent = "Copied";
+                            try { window.IKO?.logger?.info?.("Attachments", "docx extracted", { name: rec.name, tokens: rec.origTokens }); } catch { /* ignore */ }
+                        } catch (err) {
+                            extract.textContent = "Failed";
+                            say(String(err?.message || err).slice(0, 120), false);
                         }
-                    } catch (err) { parse.textContent = "Failed"; say(`Parse failed: ${String(err?.message || err).slice(0, 100)}`, false); }
-                    setTimeout(() => { parse.textContent = "Parse"; }, 2000);
+                        setTimeout(() => { extract.textContent = "Extract"; }, 2000);
+                    });
+                    const cp = document.createElement("button");
+                    cp.type = "button"; cp.className = "iko-att-btn";
+                    cp.textContent = "Copy";
+                    cp.title = "Copy a one-line descriptor";
+                    cp.addEventListener("click", async () => {
+                        try { await copyText(compactDescriptor(rec, null)); cp.textContent = "Copied"; }
+                        catch { cp.textContent = "Blocked"; }
+                        setTimeout(() => { cp.textContent = "Copy"; }, 1500);
+                    });
+                    btns.append(extract, cp);
+                } else {
+                    const cp = document.createElement("button");
+                    cp.type = "button"; cp.className = "iko-att-btn primary";
+                    cp.textContent = "Copy";
+                    cp.title = "Legacy .doc — copy a descriptor; save as .docx for text extraction";
+                    cp.addEventListener("click", async () => {
+                        try {
+                            await copyText(compactDescriptor(rec, null));
+                            cp.textContent = "Copied";
+                            say("Legacy .doc — save as .docx to extract its text", false);
+                        } catch { cp.textContent = "Blocked"; }
+                        setTimeout(() => { cp.textContent = "Copy"; }, 1500);
+                    });
+                    btns.appendChild(cp);
+                }
+            } else {
+                const compressPdfBtn = document.createElement("button");
+                compressPdfBtn.type = "button";
+                compressPdfBtn.className = "iko-att-btn primary";
+                compressPdfBtn.textContent = "Compress";
+                compressPdfBtn.title = "Compress the PDF into readable, token-saving text (auto-OCR for image-only pages) and copy it";
+                compressPdfBtn.addEventListener("click", async () => {
+                    compressPdfBtn.textContent = "…";
+                    try {
+                        const res = await extractPdfText(rec.file, { ocr: "auto" });
+                        const full = String(res.fullText || "");
+                        const text = String(res.text || full);
+                        if (!text || text.replace(/[^\p{L}\p{N}]/gu, "").length < 20) {
+                            throw new Error("No readable text found — this PDF may be scanned and OCR did not return text.");
+                        }
+                        const copied = await copyText(text);
+                        const tokens = countTextTokens(text);
+                        const tokensIn = countTextTokens(full) || tokens;
+                        const saved = tokensIn > tokens ? Math.max(0, Math.round((1 - tokens / tokensIn) * 100)) : 0;
+                        const ocrBits = res.ocrPages
+                            ? ` · OCR ${res.ocrPages}p conf ${Math.round(Number(res.ocrConfidence || 0) * 100)}%`
+                            : "";
+                        const ocrWarn = res.ocrLowConfidence ? " · OCR low-confidence" : "";
+                        const truncatedBit = res.truncated ? " (truncated)" : "";
+                        say(
+                            `PDF · ${res.pages}p · ~${fmtTok(tokensIn)} → ~${fmtTok(tokens)} tokens · −${saved}%${ocrBits}${ocrWarn}${truncatedBit} · ${copied ? "copied" : "copy blocked"}`,
+                            copied
+                        );
+                        try { window.IKO?.logger?.info?.("Attachments", "pdf compressed", { name: rec.name, pages: res.pages, savedPct: res.savedPct }); } catch { /* ignore */ }
+                        compressPdfBtn.textContent = copied ? "Copied" : "Blocked";
+                    } catch (err) {
+                        compressPdfBtn.textContent = "Failed";
+                        say(String(err?.message || err).slice(0, 140), false);
+                    }
+                    setTimeout(() => { compressPdfBtn.textContent = "Compress"; }, 2200);
+                });
+                const fullTextBtn = document.createElement("button");
+                fullTextBtn.type = "button";
+                fullTextBtn.className = "iko-att-btn";
+                fullTextBtn.textContent = "Full text";
+                fullTextBtn.title = "Extract the full readable PDF text (no compression) and copy it";
+                fullTextBtn.addEventListener("click", async () => {
+                    fullTextBtn.textContent = "…";
+                    try {
+                        const res = await extractPdfText(rec.file, { ocr: "auto" });
+                        const full = String(res.fullText || "");
+                        if (!full || full.replace(/[^\p{L}\p{N}]/gu, "").length < 20) {
+                            throw new Error("No readable text found.");
+                        }
+                        const copied = await copyText(full);
+                        say(`PDF full text · ${res.pages}p · ~${fmtTok(countTextTokens(full))} tokens · ${copied ? "copied" : "copy blocked"}${res.truncated ? " (truncated)" : ""}`, copied);
+                        fullTextBtn.textContent = copied ? "Copied" : "Blocked";
+                    } catch (err) {
+                        fullTextBtn.textContent = "Failed";
+                        say(String(err?.message || err).slice(0, 140), false);
+                    }
+                    setTimeout(() => { fullTextBtn.textContent = "Full text"; }, 2200);
                 });
                 const cp = document.createElement("button");
-                cp.type = "button"; cp.className = "iko-att-btn";
+                cp.type = "button";
+                cp.className = "iko-att-btn";
                 cp.textContent = "Copy";
                 cp.title = "Copy a one-line descriptor";
                 cp.addEventListener("click", async () => {
@@ -503,48 +710,20 @@ function openPanel() {
                     catch { cp.textContent = "Blocked"; }
                     setTimeout(() => { cp.textContent = "Copy"; }, 1500);
                 });
-                btns.append(parse, cp);
-                const ocrBtn = document.createElement("button");
-                ocrBtn.type = "button"; ocrBtn.className = "iko-att-btn";
-                ocrBtn.textContent = "OCR";
-                ocrBtn.title = "Scanned pages need a rasterized image — screenshot the page";
-                ocrBtn.addEventListener("click", async () => {
-                    ocrBtn.textContent = "…";
-                    try {
-                        const ocr = window.IKOOCRCore;
-                        const sir = window.IKOSIRCore;
-                        if (!ocr) throw new Error("OCR engine loading — wait 2s and retry");
-                        const buf = await rec.file.arrayBuffer();
-                        // Scanned PDFs need page raster (pdf.js render) before pixels exist —
-                        // try peer/VLM directly on the blob; honest route when absent.
-                        say("Loading local OCR…");
-                        const res = await ocr.scannedToSIR(rec.file, { id: rec.name, title: rec.name, kind: "pdf-scan" }, sir || null);
-                        void buf;
-                        if (res.route === "sir") {
-                            try { await navigator.clipboard.writeText(res.l3); } catch { /* ignore */ }
-                            const conf = Math.round(Number(res.ocr.confidence || 0) * 100);
-                            const low = res.ocr.lowConfidence === true;
-                            say(`OCR copied · conf ${conf}%${low ? " (low — check text)" : ""}`, !low);
-                            ocrBtn.textContent = low ? "Copied ⚠" : "Copied";
-                        } else {
-                            say(ocrFailureText(res.ocr), false);
-                            ocrBtn.textContent = res.ocr?.route === "ocr-empty" ? "No text" : "Failed";
-                        }
-                    } catch (err) { ocrBtn.textContent = "Failed"; }
-                    setTimeout(() => { ocrBtn.textContent = "OCR"; }, 2000);
-                });
-                btns.appendChild(ocrBtn);
+                btns.append(compressPdfBtn, fullTextBtn, cp);
             }
             card.append(top, meta, status, btns);
             list.appendChild(card);
         }
     };
+    panelRender = render;
     render();
     document.body.appendChild(root);
 }
 
 window.IKO.attachments = {
     recordFile, compressImage, estimateImageTokens, estimatePdfTokens,
+    estimateWordTokens, wordKind, extractWordText,
     list: () => [...seenFiles], openPanel, compactDescriptor
 };
 try { window.addEventListener("iko-attachments-requested", openPanel); } catch { /* ignore */ }

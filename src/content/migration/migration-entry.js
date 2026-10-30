@@ -12,6 +12,7 @@ const { optimizePrompt } = require("../prompt-optimizer/optimizer.js");
 const IKOSIR = require("../../migration/sir/sir.js");
 const IKOPDF = require("../../migration/sir/pdf.js");
 const IKOOCR = require("../../migration/sir/ocr.js");
+const IKODOCX = require("../../migration/sir/docx.js");
 const IKORETRIEVAL = require("../../migration/sir/retrieval.js");
 
 require("./iko-log.js");
@@ -25,6 +26,7 @@ window.IKOOptimizerCore = { optimizePrompt };
 window.IKOSIRCore = IKOSIR;
 window.IKOPDFCore = IKOPDF;
 window.IKOOCRCore = IKOOCR;
+window.IKODOCXCore = IKODOCX;
 window.IKORETRIEVALCore = IKORETRIEVAL;
 
 window.IKOMigrationCore = {

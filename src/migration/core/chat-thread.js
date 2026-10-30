@@ -13,9 +13,14 @@ const { PLATFORMS, matchPlatform } = require("../platforms.js");
 // The conventions the migration adapters rely on, in their historical order:
 // platform-specific selectors first, then the universal ones.
 const UNIVERSAL_SELECTORS = [
+    // ChatGPT's 2026 app shell: one wrapper per message, role in the suffix
+    // ("…:user" / "…:assistant"). The old data-message-author-role /
+    // conversation-turn attributes are gone on these pages.
+    "[data-chatgpt-search-unit-key]",
     "[data-message-author-role]",
     '[data-testid^="conversation-turn-"]',
     "[data-message-id]",
+    "[data-turn]",
     "main article",
     "main [data-turn]",
     'main div[id^="message-"]'
@@ -39,13 +44,7 @@ const DOMINANT_CHILD_RATIO = 0.7;
 // worth measuring the whole thread to compare.
 const PARTIAL_PRECHECK_CHARS = 1500;
 const PARTIAL_READ_RATIO = 0.25;
-// Short ChatGPT threads can be real conversations well below 400 characters
-// (for example a greeting exchange), so the hard floor is low. Between the
-// floor and THREAD_FULL_CHARS a thread is trusted only when it splits into
-// message-sized blocks, so a single welcome/hero panel still reads as
-// "waiting" instead of as usage.
-const THREAD_MIN_CHARS = 120;
-const THREAD_FULL_CHARS = 400;
+const THREAD_MIN_CHARS = 400;
 
 
 function selectorsFor(platformId) {
@@ -59,6 +58,25 @@ function selectorsFor(platformId) {
     return out;
 }
 
+// Sidebars and hidden panels are chrome, not conversation: ChatGPT's app shell
+// can keep the whole chat history mounted outside <main> (and off-screen), and
+// the text walk would otherwise count it as context.
+function isChrome(el) {
+    if (!el || !el.tagName) return false;
+    if (CHROME_TAGS.has(el.tagName)) return true;
+    try {
+        if (el.hidden) return true;
+        if (el.getAttribute?.("hidden") !== null) return true;
+        if (/(^|\s)sr-only(\s|$)/.test(el.getAttribute?.("class") || "")) return true;
+        if (el.getAttribute?.("aria-hidden") === "true") return true;
+        const role = el.getAttribute?.("role") || "";
+        if (role === "navigation" || role === "complementary" || role === "banner" || role === "contentinfo") return true;
+        const label = el.getAttribute?.("aria-label") || "";
+        if (/chat history|sidebar|conversation history/i.test(label)) return true;
+    } catch { /* ignore */ }
+    return false;
+}
+
 // innerText reflects what is actually rendered, but Chrome returns "" for
 // subtrees it has not laid out yet — content-visibility skips, turns that are
 // still streaming in, virtualised history, hidden ancestors. That silently
@@ -68,6 +86,7 @@ function readText(el, { skipChrome = false } = {}) {
     // Reading a <script>/<style> element is never conversation text, even when
     // a caller hands one in directly.
     if (!el || NOISE_TAGS.has(el.tagName)) return "";
+    if (skipChrome && isChrome(el)) return "";
     if (!skipChrome) {
         const rendered = (el.innerText || "").trim();
         if (rendered) return rendered;
@@ -82,7 +101,7 @@ function readText(el, { skipChrome = false } = {}) {
                 continue;
             }
             if (child.nodeType !== 1 || NOISE_TAGS.has(child.tagName)) continue;
-            if (skipChrome && CHROME_TAGS.has(child.tagName)) continue;
+            if (isChrome(child)) continue;
             walk(child);
         }
     };
@@ -105,6 +124,38 @@ function textOf(el) {
     return readText(el);
 }
 
+function stripRoleLabel(content) {
+    // The 2026 ChatGPT assistant wrapper keeps the sr-only "ChatGPT said:"
+    // label inside the same node as the answer. It is a label, not context.
+    return String(content || "").replace(/^\s*(?:you|user|chatgpt|assistant|model)\s+said:\s*/i, "").trim();
+}
+
+// An SPA can keep the previous chat mounted while the next one renders
+// (ChatGPT's 2026 shell leaves the old workspace in a display:none div).
+// querySelectorAll still sees those hidden messages; counting them is what
+// made the HUD jump to the previous chat's number after switching tabs.
+function isVisibleNode(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+        for (let node = el; node && node.nodeType === 1; node = node.parentElement || node.parent) {
+            if (node.hidden) return false;
+            if (node.getAttribute?.("hidden") !== null) return false;
+            if (node.getAttribute?.("inert") !== null) return false;
+            if (node.getAttribute?.("aria-hidden") === "true") return false;
+            if (typeof getComputedStyle === "function") {
+                const style = getComputedStyle(node);
+                if (style.display === "none" || style.visibility === "hidden" ||
+                    style.visibility === "collapse" || style.contentVisibility === "hidden") return false;
+            }
+        }
+        if (typeof el.getBoundingClientRect === "function") {
+            const rect = el.getBoundingClientRect();
+            if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+        }
+        return true;
+    } catch { return true; }
+}
+
 function roleOf(el) {
     let attr = "";
     try {
@@ -114,6 +165,35 @@ function roleOf(el) {
         }
     } catch { /* ignore */ }
     if (attr === "assistant" || attr === "system" || attr === "user") return attr;
+
+    let turn = "";
+    try {
+        turn = el.getAttribute?.("data-turn") || el.querySelector?.("[data-turn]")?.getAttribute("data-turn") || "";
+    } catch { /* ignore */ }
+    if (turn === "assistant" || turn === "system" || turn === "user") return turn;
+
+    // ChatGPT 2026: each message wrapper carries its role in the unit key
+    // ("fallback-turn-0:1:assistant"), and the visible role label is an
+    // sr-only <h4 data-conversation-role="assistant">ChatGPT said:</h4>.
+    let unit = "";
+    try {
+        unit = el.getAttribute?.("data-chatgpt-search-unit-key") ||
+            el.getAttribute?.("data-content-search-unit-key") ||
+            el.querySelector?.("[data-chatgpt-search-unit-key]")?.getAttribute("data-chatgpt-search-unit-key") || "";
+    } catch { /* ignore */ }
+    if (/:assistant$/.test(unit)) return "assistant";
+    if (/:user$/.test(unit)) return "user";
+
+    let conversationRole = "";
+    try {
+        conversationRole = el.getAttribute?.("data-conversation-role") ||
+            el.querySelector?.("[data-conversation-role]")?.getAttribute("data-conversation-role") || "";
+    } catch { /* ignore */ }
+    if (conversationRole === "assistant" || conversationRole === "system" || conversationRole === "user") return conversationRole;
+
+    const label = (el.querySelector?.(".sr-only")?.textContent || "").trim().toLowerCase();
+    if (/^(chatgpt|assistant|model) said:/.test(label)) return "assistant";
+    if (/^(you|user) said:/.test(label)) return "user";
 
     const tag = [
         el.getAttribute?.("data-testid") || "",
@@ -156,11 +236,12 @@ function byDocumentOrder(a, b) {
 }
 
 function fromSelectors(platformId) {
-    const nodes = innermost(collect(selectorsFor(platformId))).sort(byDocumentOrder);
+    const nodes = innermost(collect(selectorsFor(platformId)).filter(isVisibleNode)).sort(byDocumentOrder);
     const messages = [];
+    const matchedNodes = [];
     const seenText = new Set();
     for (const node of nodes) {
-        const content = textOf(node);
+        const content = stripRoleLabel(textOf(node));
         if (!content || content.length < MIN_MESSAGE_CHARS) continue;
         if (content.length >= LONG_TEXT_DUP_CHARS && seenText.has(content)) continue;
         seenText.add(content);
@@ -169,8 +250,43 @@ function fromSelectors(platformId) {
             role: roleOf(node) || (messages.length % 2 === 0 ? "user" : "assistant"),
             content
         });
+        matchedNodes.push(node);
     }
-    return messages;
+    return { messages, nodes: matchedNodes };
+}
+
+function parentOf(node) {
+    return node?.parentElement || node?.parent || null;
+}
+
+// Lowest common ancestor of the matched message nodes: the conversation
+// region, not the page shell. Used for the partial-markup comparison so the
+// sidebar/history can never stand in for a short chat.
+function commonAncestor(nodes) {
+    if (!nodes.length) return null;
+    let holder = parentOf(nodes[0]);
+    for (let i = 1; i < nodes.length && holder; i++) {
+        while (holder && !(holder.contains && holder.contains(nodes[i]))) holder = parentOf(holder);
+    }
+    return holder;
+}
+
+function matchHolder(nodes, fallback) {
+    if (!nodes.length) return fallback;
+    const holder = commonAncestor(nodes);
+    if (!holder) return fallback;
+    try {
+        // Never compare against the whole page: a body-level holder includes
+        // the sidebar/history and would replace the conversation with it.
+        if (fallback === document.body || fallback === document.documentElement) return holder;
+    } catch { /* ignore */ }
+    const holdsMatches = nodes.every((node) => {
+        try { return Boolean(fallback?.contains?.(node)); } catch { return false; }
+    });
+    // A thread container that holds the matched messages is authoritative even
+    // when only some turns matched (partial markup). If it does not hold them,
+    // it is the sidebar/app shell — use the messages' common ancestor instead.
+    return holdsMatches ? fallback : holder;
 }
 
 // Fallback for sites whose message markup we do not know: walk down from <main>
@@ -209,7 +325,7 @@ function threadContainer() {
         let examined = 0;
         for (const child of el.children || []) {
             if (examined++ > MAX_CHILDREN) break;
-            if (!child.tagName || NOISE_TAGS.has(child.tagName) || CHROME_TAGS.has(child.tagName)) continue;
+            if (!child.tagName || NOISE_TAGS.has(child.tagName) || isChrome(child)) continue;
             const len = textLength(child);
             if (len > bestLen) { bestLen = len; bestChild = child; }
         }
@@ -232,7 +348,7 @@ function looksLikeList(el) {
         return out;
     };
     for (const child of elementChildren(el)) {
-        if (!child.tagName || NOISE_TAGS.has(child.tagName) || CHROME_TAGS.has(child.tagName)) continue;
+        if (!child.tagName || NOISE_TAGS.has(child.tagName) || isChrome(child)) continue;
         if (textLength(child) >= BLOCK_MIN_CHARS) {
             count++;
             if (count >= 2) return true;
@@ -255,7 +371,7 @@ function blockCount(el) {
     const walk = (node, depth) => {
         if (count >= 2 || depth > 3) return;
         for (const child of elementChildren(node)) {
-            if (!child.tagName || NOISE_TAGS.has(child.tagName) || CHROME_TAGS.has(child.tagName)) continue;
+            if (!child.tagName || NOISE_TAGS.has(child.tagName) || isChrome(child)) continue;
             if (textLength(child) >= BLOCK_MIN_CHARS) {
                 count++;
                 if (count >= 2) return;
@@ -270,7 +386,7 @@ function blockCount(el) {
 
 // Cheap length of the same text readText would return (no big string built).
 function textLength(el) {
-    if (!el || NOISE_TAGS.has(el.tagName)) return 0;
+    if (!el || NOISE_TAGS.has(el.tagName) || isChrome(el)) return 0;
     let length = 0;
     let nodes = 0;
     const walk = (node) => {
@@ -281,7 +397,7 @@ function textLength(el) {
                 length += String(child.nodeValue || "").length + 1;
                 continue;
             }
-            if (child.nodeType !== 1 || NOISE_TAGS.has(child.tagName) || CHROME_TAGS.has(child.tagName)) continue;
+            if (child.nodeType !== 1 || NOISE_TAGS.has(child.tagName) || isChrome(child)) continue;
             walk(child);
         }
     };
@@ -306,16 +422,50 @@ function fromThread(container) {
     // Reaching here without descending means <main> itself is the container:
     // trust it only when it splits into message-sized blocks, so a welcome
     // screen (one hero block) still reads as "waiting", not as usage.
-    if (!found.descended && blockCount(el) < 2) return { messages: [], reason: `welcome-screen(${blockCount(el)} blocks)` };
+    if (!found.descended && blockCount(el) < 2) {
+        // A large single block on a real conversation URL is still a real
+        // thread (ChatGPT sometimes renders the whole thread as one node).
+        if (content.length >= THREAD_MIN_CHARS) return { messages: [{ role: "user", content, fallback: true, thread: true }], reason: "thread-estimate" };
+        return { messages: [], reason: `welcome-screen(${blockCount(el)} blocks)` };
+    }
 
     return { messages: [{ role: "user", content, fallback: true, thread: true }], reason: "thread-estimate" };
+}
+
+// ChatGPT's new-chat screen ("Hey, omen. Ready to dive in?") is not a
+// conversation: the URL has no conversation id and the DOM has no message
+// markup. The app shell around it can still hold text (sidebar history, hidden
+// panels), so the estimate/deep-scan reports phantom tokens on an empty chat.
+// Only a real conversation URL may be estimated when no markup matched.
+function isChatGPTNewChat(platformId) {
+    if (platformId !== "chatgpt") return false;
+    try {
+        if (typeof location === "undefined" || !location.pathname) return false;
+        // Real conversations live under /c/<uuid> (legacy /c/<id> included).
+        return !/\/c\/[0-9A-Za-z_-]{8,}/.test(location.pathname);
+    } catch { return false; }
+}
+
+function hasMessageMarkup() {
+    try {
+        const nodes = document.querySelectorAll(
+            '[data-message-author-role], [data-testid^="conversation-turn-"], [data-turn], [data-chatgpt-search-unit-key]'
+        );
+        for (const node of nodes) {
+            if (isVisibleNode(node) && textLength(node) > MIN_MESSAGE_CHARS) return true;
+        }
+        return false;
+    } catch { return false; }
 }
 
 // -> { messages: [{ role, content }], source: "selectors" | "thread" | "none", reason }
 function extractChatThread(platformId) {
     let messages = [];
+    let matchedNodes = [];
     try {
-        messages = fromSelectors(platformId);
+        const found = fromSelectors(platformId);
+        messages = found.messages;
+        matchedNodes = found.nodes || [];
     } catch { /* fall through to the thread estimate */ }
 
     const matchedChars = messages.reduce((total, message) => total + message.content.length, 0);
@@ -328,33 +478,65 @@ function extractChatThread(platformId) {
 
     // Known markup can cover only half the conversation (answers but not
     // questions, or a renamed turn). A confident tiny number is worse than an
-    // honest thread-wide estimate, so compare against the whole thread.
+    // honest thread-wide estimate, so compare against the whole thread — but
+    // only against a container that actually holds the matched messages. On
+    // ChatGPT's 2026 app shell the thread and the sidebar are siblings, so
+    // threadContainer() can be the sidebar; using it here replaced a
+    // two-message "hello" chat with ~1,000 sidebar tokens.
     if (messages.length && container?.el) {
-        const threadChars = textLength(container.el);
-        if (threadChars > THREAD_MIN_CHARS && matchedChars < threadChars * PARTIAL_READ_RATIO) {
-            const estimate = fromThread(container);
+        const holder = matchHolder(matchedNodes, container.el);
+        const holdsMatches = matchedNodes.length > 0 &&
+            matchedNodes.every((node) => {
+                try { return Boolean(holder?.contains?.(node)); } catch { return false; }
+            });
+        const threadChars = textLength(holder);
+        if (holdsMatches && threadChars > THREAD_MIN_CHARS && matchedChars < threadChars * PARTIAL_READ_RATIO) {
+            const estimate = fromThread({ el: holder, descended: true });
             if (estimate.messages.length) return { messages: estimate.messages, source: "thread", reason: `partial-markup → ${estimate.reason}` };
         }
     }
     if (messages.length) return { messages, source: "selectors", reason: "selector-match" };
 
-    // No selector matched anything — this is either a brand-new/empty chat or a
-    // site whose markup we don't know. Accept a whole-thread estimate only when
-    // the text is substantial enough to be a real conversation; a welcome/hero
-    // screen ("Where should we begin?", feature tiles) is short marketing text
-    // and must read as "waiting", not as usage.
-    if (messages.length === 0 && container?.el) {
-        const threadChars = container.chars || textLength(container.el);
-        // Two gates: the hard floor (nothing readable at all) and the compact
-        // gate (a small thread is only trusted when it splits into ≥2
-        // message-sized blocks — a lone hero panel is not a conversation).
-        if (threadChars < THREAD_MIN_CHARS || (threadChars < THREAD_FULL_CHARS && blockCount(container.el) < 2)) {
-            return { messages: [], source: "none", reason: `thread-too-small(${threadChars})` };
-        }
+    // A new ChatGPT chat has no conversation to count. This must come before
+    // the estimate/deep-scan: those fallbacks can read the welcome screen or
+    // the app shell and report 75–1,000 phantom tokens on an empty chat. If
+    // message markup exists (e.g. a temporary chat at "/"), the guard stays off
+    // and the estimate still works.
+    if (isChatGPTNewChat(platformId) && !hasMessageMarkup()) {
+        return { messages: [], source: "none", reason: "new-chat" };
     }
 
-    const estimate = fromThread(container);
-    if (estimate.messages.length) return { messages: estimate.messages, source: "thread", reason: estimate.reason };
+    // No selector matched anything — this is either a brand-new/empty chat or a
+    // site whose markup we don't know. The thread container may be a small app
+    // shell whose real conversation lives outside <main> (e.g. ChatGPT's 2026
+    // app shell moves the thread to a sibling or a portal). When the container
+    // is too small but the page holds far more text elsewhere, deep-scan the
+    // whole page instead of giving up. A welcome screen (short hero text, all
+    // inside <main>) is rejected: it has no ≥2 message-sized blocks.
+    let estimate = null;
+    if (container?.el) {
+        const threadChars = container.chars || textLength(container.el);
+        const bodyText = textLength(document.body || document.documentElement);
+
+        // App shell: small <main>, conversation lives outside it (body has far
+        // more text). Skip the thread estimate and deep-scan the page.
+        if (threadChars < THREAD_MIN_CHARS && bodyText > threadChars * 3 && bodyText >= THREAD_MIN_CHARS) {
+            // fall through to deepScan below
+        } else {
+            estimate = fromThread(container);
+            if (estimate.messages.length) {
+                // When no selectors matched at all and the container is small,
+                // require ≥2 message-sized blocks so a single hero block doesn't
+                // pass as a conversation. Large containers (≥ THREAD_MIN_CHARS)
+                // are trusted as-is (a real single-message thread).
+                if (threadChars >= THREAD_MIN_CHARS || blockCount(container.el) >= 2) {
+                    return { messages: estimate.messages, source: "thread", reason: estimate.reason };
+                }
+                return { messages: [], source: "none", reason: `thread-too-small(${threadChars})` };
+            }
+            return { messages: [], source: "none", reason: estimate?.reason || `thread-too-small(${threadChars})` };
+        }
+    }
 
     // Last resort: deep-scan the page for the largest text block that looks
     // like a conversation container (covers sites whose DOM we know nothing
@@ -367,7 +549,7 @@ function extractChatThread(platformId) {
         }
     }
 
-    return { messages: [], source: "none", reason: estimate.reason || "no-container" };
+    return { messages: [], source: "none", reason: estimate?.reason || "no-container" };
 }
 
 // --- deep scan fallback -------------------------------------------------------
@@ -390,7 +572,7 @@ function deepScanContainer() {
     const walk = (node, depth) => {
         if (depth > 10) return;
         for (const child of elementChildren(node)) {
-            if (!child.tagName || NOISE_TAGS.has(child.tagName) || CHROME_TAGS.has(child.tagName)) continue;
+            if (!child.tagName || NOISE_TAGS.has(child.tagName) || isChrome(child)) continue;
             const len = textLength(child);
             if (len >= 50) {
                 const score = len;

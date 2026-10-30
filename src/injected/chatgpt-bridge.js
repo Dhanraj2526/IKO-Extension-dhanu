@@ -63,6 +63,7 @@
         const u = urlOf(args[0]);
 
         try {
+            rememberConversationUrl(u);
             const clone = resp.clone();
 
             clone.json().then((data) => {
@@ -93,6 +94,7 @@
 
         xhr.addEventListener("load", function () {
             try {
+                rememberConversationUrl(u);
                 const data = JSON.parse(xhr.responseText);
 
                 if (isConvUrl(u)) {
@@ -107,5 +109,46 @@
 
         return origSend.apply(this, a);
     };
+
+    // The conversation the page last loaded (detail URL with a real id). Used
+    // only to remember which conversation id we last saw — so we never count
+    // another conversation's payload after SPA navigation.
+    let lastConversationId = "";
+
+    function rememberConversationUrl(url) {
+        const s = String(url || "");
+        if (!s) return;
+        try {
+            const u = new URL(s, location.href);
+            const m = u.pathname.match(/^\/backend-api\/conversations?\/([0-9a-zA-Z-]+)/);
+            if (!m) return;
+            lastConversationId = m[1];
+        } catch { /* ignore */ }
+    }
+
+    // ChatGPT's conversation endpoint 404s/422s on isolated-world fetches, so
+    // we never call it directly. The page itself re-fetches the conversation
+    // after every follow-up, and the bridge captures that payload via the
+    // fetch/XHR hooks above. A refresh request just tells the content world to
+    // re-count whatever the bridge already holds.
+    window.addEventListener("message", function (event) {
+        try {
+            if (event.source !== window) return;
+            const msg = event.data;
+            if (!msg || msg.source !== "IKO_CHATGPT_CONTENT" || msg.type !== "REQUEST_REFRESH") return;
+            // Invalidate on the content side is handled there; here we just
+            // make sure a capture is pending by re-publishing the last known
+            // payload if we have one.
+            const bridge = window.IKO?.chatgptBridge;
+            if (bridge?.latestValidConversation) {
+                const payload = bridge.latestValidConversation;
+                const id = String(payload?.conversation_id || "");
+                if (id && id === lastConversationId) {
+                    publish("CONVERSATION_DATA", { url: location.href, data: payload });
+                }
+            }
+        } catch { /* never break the page */ }
+    });
+
     publish("BRIDGE_READY", { href: location.href });
 })();

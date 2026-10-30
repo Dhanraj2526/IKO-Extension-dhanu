@@ -84,6 +84,10 @@ let bridgeCache = { payload: null, messages: [], tokens: -1, initialized: false 
 // opposite of the truth ("less context in use"). Keep the largest count seen
 // for this conversation; starting or switching chats resets it.
 let highWater = { key: "", tokens: 0 };
+// Whole-conversation refreshes are debounced to the end of a stream, and to a
+// submitted query: every new turn must advance the HUD without a page reload.
+let conversationRefreshTimer = null;
+let lastRefreshDomSignature = "";
 // Identity of the open conversation on *any* site, not just ChatGPT: host +
 // path. Every change means a different chat, so the signature cache, the
 // bridge payload and the endpoint attempt must all be dropped — otherwise the
@@ -145,19 +149,33 @@ function bridgeTokens() {
 // conversation is in hand, ask the same same-origin endpoint the migration
 // adapter uses — the cookies the page already has are enough. Once per
 // conversation (retried after a minute so a hiccup is not permanent).
-let remoteAttempt = { id: "", at: 0, pending: false };
+let remoteAttempt = { id: "", at: 0, pending: false, queued: false };
 
 function conversationId() {
     const last = location.pathname.split("/").filter(Boolean).pop() || "";
     return /^[0-9a-zA-Z-]{10,}$/.test(last) ? last : "";
 }
 
-function fetchConversation() {
+// force=true is used after a query is submitted: the 60 s cooldown exists to
+// stop idle polling, but a new turn is exactly when the cached payload is
+// stale and the HUD must refresh itself instead of waiting for a page reload.
+function fetchConversation(force = false) {
     const id = conversationId();
     if (!id) return;
-    if (remoteAttempt.pending && remoteAttempt.id === id) return;
-    if (id === remoteAttempt.id && Date.now() - remoteAttempt.at < 60000) return;
-    remoteAttempt = { id, at: Date.now(), pending: true };
+    if (remoteAttempt.pending && remoteAttempt.id === id) {
+        // A forced refresh arrived while the previous request was in flight
+        // (usually the stream ended mid-fetch). Run it once more afterwards.
+        if (force) remoteAttempt.queued = true;
+        return;
+    }
+    if (!force && id === remoteAttempt.id && Date.now() - remoteAttempt.at < 60000) return;
+    remoteAttempt = { id, at: Date.now(), pending: true, queued: false };
+    // Primary refresh channel: the page's own bridge re-fetches the conversation
+    // through the page's runtime (a content-script fetch cannot always reach the
+    // conversation endpoints — they 422/404 here). The bridge publishes the fresh
+    // payload back, which drives update() via the conversation-updated event.
+    // The content-side fetch below stays as a fallback.
+    try { window.IKO?.chatgptBridge?.requestConversationRefresh?.(); } catch { /* ignore */ }
     const log = (level, message, data) => {
         try { window.IKO.logger?.[level]?.("ChatGPT-HUD", message, data); } catch { /* ignore */ }
         const method = level === "warn" ? "warn" : "log";
@@ -197,7 +215,25 @@ function fetchConversation() {
                 log("warn", `conversation fetch failed (${path})`, { error: String(error?.message || error).slice(0, 160) });
             }
         }
-    })().finally(() => { if (remoteAttempt.id === id) remoteAttempt.pending = false; });
+    })().finally(() => {
+        if (remoteAttempt.id !== id) return;
+        remoteAttempt.pending = false;
+        if (remoteAttempt.queued) {
+            remoteAttempt.queued = false;
+            setTimeout(() => fetchConversation(true), 250);
+        }
+    });
+}
+
+// New turns change the DOM in ways the observer can see, but the HUD must also
+// survive sites that mutate outside the observed subtree or rename their
+// markup: debounce a whole-conversation read until the answer stops streaming.
+function scheduleConversationRefresh(delay = 2500) {
+    clearTimeout(conversationRefreshTimer);
+    conversationRefreshTimer = setTimeout(() => {
+        conversationRefreshTimer = null;
+        fetchConversation(true);
+    }, delay);
 }
 
 // A page the reader cannot fully read must be diagnosable from "Copy logs":
@@ -260,6 +296,21 @@ function signature(info, messages, source, fullTokens) {
     return (hash >>> 0).toString(16);
 }
 
+// DOM-only signature: the whole-conversation payload does not participate, so
+// a payload refresh cannot retrigger the refresh that caused it.
+function domSignature(messages) {
+    let hash = 2166136261;
+    const mix = (text) => {
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+    };
+    mix(String(messages.length));
+    for (const message of messages) mix(message.content);
+    return (hash >>> 0).toString(16);
+}
+
 function update() {
     if (!window.IKO.ui) return;
     if (counting) return;
@@ -278,7 +329,10 @@ function update() {
         lastSignature = "";
         lastDiagnostic = "";
         bridgeCache = { payload: null, messages: [], tokens: -1, initialized: false };
-        remoteAttempt = { id: "", at: 0, pending: false };
+        remoteAttempt = { id: "", at: 0, pending: false, queued: false };
+        clearTimeout(conversationRefreshTimer);
+        conversationRefreshTimer = null;
+        lastRefreshDomSignature = "";
         try {
             const bridge = window.IKO?.chatgptBridge;
             if (bridge) {
@@ -321,6 +375,18 @@ function update() {
     const full = bridgeMessages();
     // ChatGPT without a conversation in hand: ask the page's own endpoint.
     if (!full.length && info.id === "chatgpt") fetchConversation();
+
+    // Every new turn is a reason to re-read the whole conversation. The DOM
+    // signature keeps changing while an answer streams, so the debounce fires
+    // once the answer has settled; a submitted query also arms it directly
+    // (see watchQuerySubmits) for builds whose DOM we cannot observe.
+    if (messages.length) {
+        const domSig = domSignature(messages);
+        if (domSig !== lastRefreshDomSignature) {
+            lastRefreshDomSignature = domSig;
+            if (info.id === "chatgpt") scheduleConversationRefresh(2500);
+        }
+    }
 
     if (!messages.length && !full.length) {
         lastSignature = "";
@@ -492,6 +558,45 @@ function watchUrl() {
 }
 
 
+// A submitted query is the moment the cached conversation is guaranteed to be
+// stale. Watching the composer's own events makes the HUD react even when the
+// site renders the new turn somewhere the MutationObserver does not see.
+function isComposerTarget(target) {
+    const el = target?.nodeType === 1 ? target : target?.parentElement;
+    if (!el) return false;
+    try {
+        if (el.matches?.("form") && el.querySelector("#prompt-textarea, textarea, [contenteditable='true'], .ProseMirror")) return true;
+        if (el.closest?.("#prompt-textarea, textarea, [contenteditable='true'], .ProseMirror")) return true;
+        const composer = window.IKOComposer?.findComposer?.();
+        return Boolean(composer && (composer === el || composer.contains?.(el)));
+    } catch { return false; }
+}
+
+let lastSubmitAt = 0;
+
+function noteQuerySubmitted() {
+    // Enter, the form submit and a send-button click can all fire for one send.
+    const now = Date.now();
+    if (now - lastSubmitAt < 1200) return;
+    lastSubmitAt = now;
+    scheduleUpdate(0);
+    if (platformInfo().id === "chatgpt") scheduleConversationRefresh(2500);
+}
+
+function watchQuerySubmits() {
+    document.addEventListener("submit", (event) => {
+        if (isComposerTarget(event.target)) noteQuerySubmitted();
+    }, true);
+    document.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+        if (isComposerTarget(event.target)) noteQuerySubmitted();
+    }, true);
+    document.addEventListener("click", (event) => {
+        const button = event.target?.closest?.('#composer-submit-button, [data-testid="send-button"], button[aria-label*="Send" i], button[data-testid*="send" i]');
+        if (button) noteQuerySubmitted();
+    }, true);
+}
+
 function initialize() {
     console.log("[IKO ChatGPT] Context HUD initializing");
     window.IKO.ui.create();
@@ -500,7 +605,15 @@ function initialize() {
     timer = setInterval(update, 2000);
     watchPage();
     watchUrl();
-    window.addEventListener("iko-chatgpt-conversation-updated", () => scheduleUpdate(0));
+    watchQuerySubmits();
+    window.addEventListener("iko-chatgpt-conversation-updated", () => {
+        // Bridge data just arrived (page re-fetched the conversation after a
+        // follow-up). Invalidate the signature cache so the HUD re-counts
+        // instead of showing the stale value.
+        lastSignature = "";
+        lastRefreshDomSignature = "";
+        scheduleUpdate(0);
+    });
     window.addEventListener("iko-context-threshold-changed", () => update());
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden) update();

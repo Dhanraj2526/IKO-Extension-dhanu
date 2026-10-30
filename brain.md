@@ -1,4 +1,4 @@
-# IKO BRAIN — Complete Project Knowledge (v0.2.0-universal+attachments+dragbot+sir-p0+p1-pdf+p1b-ocr+p2-retrieval+hud-drag+copilot-fix+claude-fix+full-history+hud-loading-fix+reconnect+hud-welcome-gate+extension-logo)
+# IKO BRAIN — Complete Project Knowledge (v0.2.0-universal+attachments+dragbot+sir-p0+p1-pdf+p1b-ocr+p2-retrieval+hud-drag+copilot-fix+claude-fix+full-history+hud-loading-fix+reconnect+hud-welcome-gate+hud-followup-refresh+extension-logo)
 
 > Read this first. It documents every feature, file, data flow, upgrade,
 > and how to extend the project without breaking it.
@@ -170,16 +170,19 @@ src/migration/adapters/mock-source-adapter.js + mock/mock-session.js + tests/mig
   win the walk, or an inline JSON state blob becomes "the thread" and the count
   collapses to 0; the walk also stops as soon as a level splits into ≥2
   message-sized blocks, so a chat dominated by its last answer is not walked
-  into a single paragraph). If the selector reading covers <25% of the thread
-  text and is under 1500 chars it is replaced by that estimate — a confident
-  tiny number is the bug users reported. The no-selector estimate is gated
-  twice: below `THREAD_MIN_CHARS` (120) there is nothing to read, and under
-  `THREAD_FULL_CHARS` (400) it is trusted only when the container splits into
-  ≥2 message-sized blocks — so a compact real thread (a greeting exchange)
-  counts, while a lone welcome/hero panel ("Where should we begin?" + feature
-  tiles, ~270 chars) still reads as waiting. When nothing is readable,
-  `extractChatThread` returns a `reason`
-  (`no-container`, `thread-too-small(n)`, `welcome-screen(n blocks)`) which
+  into a single paragraph). The reader also understands ChatGPT's 2026 app
+  shell: `[data-chatgpt-search-unit-key]` message wrappers (role from the key
+  suffix, `data-conversation-role`, or the sr-only "ChatGPT said:" label),
+  `[data-turn]`, and hidden SPA workspaces left mounted by navigation are
+  filtered out of selector matches. When selectors cover <25% of the thread and
+  the matched messages are short, the comparison is anchored to their common
+  ancestor, never the sidebar/app shell. The no-selector estimate is gated by
+  `THREAD_MIN_CHARS` (400) or ≥2 message-sized blocks; when `<main>` is a small
+  app shell but the body holds far more text, the reader deep-scans the page
+  instead of giving up, and an empty ChatGPT `/` chat with no message markup
+  returns `new-chat` (0) instead of counting the welcome/shell. When nothing is
+  readable, `extractChatThread` returns a `reason`
+  (`no-container`, `thread-too-small(n)`, `new-chat`) which
   `main.js` writes to the console and to the log panel ("View logs → Copy logs"),
   so an unreadable site is diagnosable from a screenshot of the logs.
   `update()` every 2s with `counting` mutex: `budget/price` from
@@ -199,7 +202,12 @@ src/migration/adapters/mock-source-adapter.js + mock/mock-session.js + tests/mig
   held more messages. Both feed
   `extractConversationMessages()`: API `mapping` walked along
   `current_node → parent`, so it is the whole conversation in order without dead
-  branches. `tokens = max(domTokens, bridgeTokens, highWater)` — the bridge
+  branches. Every DOM change arms a debounced whole-conversation refresh
+  (2.5 s after the answer stops streaming); a submitted query (form submit,
+  Enter, or a send-button click) arms it immediately. `fetchConversation(force)`
+  bypasses the 60 s cooldown, queues one retry if a request is already in
+  flight, and the refreshed payload advances the HUD without a page reload.
+  `tokens = max(domTokens, bridgeTokens, highWater)` — the bridge
   covers turns the DOM no longer mounts, and the per-conversation HIGH-WATER
   mark (`hostname+pathname` key, reset when a chat is opened or started) stops
   the count from rolling back when a site unmounts old turns while scrolling.
@@ -846,6 +854,38 @@ src/migration/adapters/mock-source-adapter.js + mock/mock-session.js + tests/mig
     `icons/icon{16,32,48,128}.png` (16/32 use a simplified mark), editable
     `icons/iko-logo.svg` / `iko-logo-small.svg`, and the manifest `icons` map.
     Verified in Brave's `brave://extensions` card. `npm test` unchanged 78/78.
+
+52. Context HUD stopped updating after the first exchange in a ChatGPT chat
+    ("it updates while having the first conversation, then after the next query
+    it stays at 0 / Updating chat… until I refresh"). Root cause was the
+    reader, not the HUD loop: real ChatGPT's 2026 app shell has no
+    `data-message-author-role`, `data-turn`, `article` or message testid markup,
+    and `<main>` can be a small shell while the thread lives outside it. The
+    reader hit `thread-too-small` and returned 0, so the only number was the
+    page bridge's first payload — stale after every follow-up. Refresh helped
+    because it made ChatGPT fetch the whole conversation again. Fixes:
+    (a) `chat-thread.js` now recognizes the 2026
+        `[data-chatgpt-search-unit-key="…:user|assistant"]` wrappers, infers
+        roles from the key suffix / `data-conversation-role` / sr-only label,
+        strips "ChatGPT said:", filters hidden stale SPA workspaces, anchors
+        short readings to the matched messages' common ancestor (never the
+        sidebar), deep-scans the body when `<main>` is only an app shell, and
+        returns `new-chat` on an empty `/` chat instead of counting the welcome
+        screen. Ported with its 5 regression tests.
+    (b) `main.js` now de-bounces a forced whole-conversation read 2.5 s after
+        the DOM stops changing, and arms it immediately when a query is
+        submitted (form submit / Enter / send-button click). `fetchConversation`
+        accepts `force`, bypasses the 60 s cooldown, and queues one retry if a
+        request is already in flight. Per-chat resets cancel the pending timer.
+    Verified with two harness pages (`$HOME/iko-hud-2026-repro.html` and
+    `$HOME/iko-hud-2026-refresh.html`, served from the same `dist`): a 2026 app
+    shell with a 2-message visible chat + an 11,499-char hidden stale workspace
+    read 10 → 78 tokens
+    after appending a follow-up (hidden text ignored); a stubbed conversation
+    endpoint read 60 → 62 messages and the HUD moved 2,190 → 2,263 after the
+    same-chat follow-up, with fetch calls 1 → 2. Existing HUD probe cases pass
+    (the two status-text mismatches on new/empty chats are the pre-existing
+    `New chat` / `Updating chat…` wording). `npm test` 85/85.
 
 ## 5. Build / test / run
 
